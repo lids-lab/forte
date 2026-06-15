@@ -1,2 +1,1 @@
-# forte
-Foreign-key-role-aware Transformer Encoding for Relational Deep Learning
+# FORTE: Foreign-key-role-aware Transformer Encoding for Relational Deep Learning
