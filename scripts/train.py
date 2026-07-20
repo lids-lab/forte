@@ -40,10 +40,13 @@ def run(
     eval_freq: int = 1000,
     eval_pow2: bool = True,
     max_eval_steps: int = 40,
-    # FORTE HP (default to per-DB best; override on the CLI)
+    # FORTE HP. Default = the paper's uniform config (clp_weight=1.0, PSP alpha=0.3
+    # linear), which reproduces Tables 2-3. Pass --use_best_hp to instead use the
+    # per-DB tuned values in BEST_HP, or override any single value on the CLI.
     clp_weight: float = None,
     psp_max_weight: float = None,
     psp_schedule: str = None,
+    use_best_hp: bool = False,
     psp_perturb_roles: bool = True,
     use_clp: bool = True,
     use_psp: bool = True,
@@ -54,7 +57,8 @@ def run(
     dry_run: bool = False,
 ):
     assert leaveout in {t[0] for t in all_tasks}, f"unknown leaveout {leaveout}"
-    hp = BEST_HP.get(leaveout, dict(clp_weight=0.5, psp_max_weight=0.3, psp_schedule="linear"))
+    paper_hp = dict(clp_weight=1.0, psp_max_weight=0.3, psp_schedule="linear")  # paper Tables 2-3
+    hp = BEST_HP.get(leaveout, paper_hp) if use_best_hp else paper_hp
     clp_weight = hp["clp_weight"] if clp_weight is None else clp_weight
     psp_max_weight = hp["psp_max_weight"] if psp_max_weight is None else psp_max_weight
     psp_schedule = hp["psp_schedule"] if psp_schedule is None else psp_schedule
@@ -115,7 +119,7 @@ def run(
         # FORTE
         use_clp=use_clp,
         use_psp=use_psp,
-        use_edge_roles=True,
+        use_edge_roles=use_edge_roles,
         clp_weight=clp_weight,
         psp_max_weight=psp_max_weight,
         psp_schedule=psp_schedule,
