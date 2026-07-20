@@ -13,6 +13,7 @@ from ml_dtypes import bfloat16
 from torch import nn
 from torch.nn.attention import SDPBackend, sdpa_kernel
 from torch.nn.attention.flex_attention import create_block_mask, flex_attention
+from torch.utils.checkpoint import checkpoint as grad_checkpoint
 
 allow_ops_in_compiled_graph()
 flex_attention = torch.compile(flex_attention)
@@ -77,11 +78,12 @@ class RoRA(nn.Module):
     Manual float32 attention (Triton bf16 flex backward bug, handoff Gotcha #3).
     """
 
-    def __init__(self, d_model, num_heads, d_schema=384, d_dir=32):
+    def __init__(self, d_model, num_heads, d_schema=384, d_dir=32, use_edge_roles=True):
         super().__init__()
         self.num_heads = num_heads
         self.head_dim = d_model // num_heads
         self.d_schema = d_schema
+        self.use_edge_roles = use_edge_roles
         self.wq = nn.Linear(d_model, d_model, bias=False)
         self.wk = nn.Linear(d_model, d_model, bias=False)
         self.wv = nn.Linear(d_model, d_model, bias=False)
@@ -102,31 +104,35 @@ class RoRA(nn.Module):
         # content attention logits
         a = torch.einsum("bhqd,bhkd->bhqk", q, k) * scale          # (B,H,S,S)
 
-        # everything in float32 (manual fp32 RoRA): the model is cast to bf16, so
-        # cast the role-projection weight / params up here to avoid dtype mismatch.
-        C = C.float()                                              # (R+1, d_schema)
-        R1 = C.shape[0]
+        # everything in float32 (manual fp32 RoRA): the model is cast to bf16.
         W_role = self.w_role.weight.float()                       # (d_model, d_schema+d_dir)
         d_same = self.dir_emb.weight[DIR_SAME].float()             # (d_dir,)
         d_f2p = self.dir_emb.weight[DIR_F2P].float()
         d_p2f = self.dir_emb.weight[DIR_P2F].float()
 
-        # factored F->P and P->F role projections, contracted with K
-        def proj_K(dir_vec):
-            inp = torch.cat([C, dir_vec.expand(R1, -1)], dim=-1)    # (R+1, d_schema+d_dir)
-            P = F.linear(inp, W_role).view(R1, H, dh)              # (R+1, H, dh)
-            return torch.einsum("rhd,bhkd->bhrk", P, k) * scale     # (B,H,R+1,S)
+        # FK-independent per-direction bias (uses the learned same-row vector sigma) -> (B,H,S)
+        def dir_bias(dir_vec):
+            s = F.linear(torch.cat([self.same_row.float(), dir_vec], dim=-1), W_role).view(H, dh)
+            return torch.einsum("hd,bhkd->bhk", s, k) * scale
+        rs0 = dir_bias(d_same)                                     # same-row bias (B,H,S)
 
-        P1K = proj_K(d_f2p)                                        # (B,H,R+1,S)
-        P2K = proj_K(d_p2f)
-        E_exp = E[:, None, :, :].expand(B, H, S, S)                # (B,H,S,S) int64
-        rs1 = torch.gather(P1K, 2, E_exp)                          # (B,H,S,S)
-        rs2 = torch.gather(P2K, 2, E_exp)
+        if self.use_edge_roles:
+            # edge-level: per-FK-column bias gathered from the frozen role table C by E
+            C = C.float()                                          # (R+1, d_schema)
+            R1 = C.shape[0]
 
-        # same-row bias (FK-independent), broadcast over q
-        inp_same = torch.cat([self.same_row.float(), d_same], dim=-1)  # (d_schema+d_dir,)
-        s0 = F.linear(inp_same, W_role).view(H, dh)               # (H, dh)
-        rs0 = torch.einsum("hd,bhkd->bhk", s0, k) * scale          # (B,H,S)
+            def proj_K(dir_vec):
+                inp = torch.cat([C, dir_vec.expand(R1, -1)], dim=-1)
+                P = F.linear(inp, W_role).view(R1, H, dh)         # (R+1, H, dh)
+                return torch.einsum("rhd,bhkd->bhrk", P, k) * scale  # (B,H,R+1,S)
+
+            E_exp = E[:, None, :, :].expand(B, H, S, S)            # (B,H,S,S) int64
+            rs1 = torch.gather(proj_K(d_f2p), 2, E_exp)           # (B,H,S,S)
+            rs2 = torch.gather(proj_K(d_p2f), 2, E_exp)
+        else:
+            # direction-only (FORTE-Dir): FK-independent f2p / p2f biases, broadcast over q
+            rs1 = dir_bias(d_f2p)[:, :, None, :]                  # (B,H,1,S)
+            rs2 = dir_bias(d_p2f)[:, :, None, :]
 
         m_same = same_node[:, None].float()                        # (B,1,S,S)
         m_f2p = kv_in_f2p[:, None].float()
@@ -167,16 +173,16 @@ class LinkDecoder(nn.Module):
         self.log_temp = nn.Parameter(torch.tensor(0.07).log())
 
 
-class ForteBlock(nn.Module):
+class RelationalBlock(nn.Module):
     """FORTE block: Column -> RoRA -> Full -> FFN  (pre-norm RMSNorm + residual)."""
 
-    def __init__(self, d_model, num_heads, d_ff, d_schema):
+    def __init__(self, d_model, num_heads, d_ff, d_schema, use_edge_roles=True):
         super().__init__()
         self.norms = nn.ModuleDict(
             {l: nn.RMSNorm(d_model) for l in ["col", "rora", "full", "ffn"]}
         )
         self.col_attn = MaskedAttention(d_model, num_heads)
-        self.rora = RoRA(d_model, num_heads, d_schema)
+        self.rora = RoRA(d_model, num_heads, d_schema, use_edge_roles=use_edge_roles)
         self.full_attn = MaskedAttention(d_model, num_heads)
         self.ffn = FFN(d_model, d_ff)
 
@@ -198,7 +204,7 @@ def _make_block_mask(mask, batch_size, seq_len, device):
     )
 
 
-class Forte(nn.Module):
+class RelationalTransformer(nn.Module):
     def __init__(
         self,
         num_blocks,
@@ -207,10 +213,13 @@ class Forte(nn.Module):
         num_heads,
         d_ff,
         use_clp=True,
+        use_edge_roles=True,
+        grad_ckpt=False,
         clp_fk_mask_prob=0.10,
     ):
         super().__init__()
         self.use_clp = use_clp
+        self.grad_ckpt = grad_ckpt
         self.clp_fk_mask_prob = clp_fk_mask_prob
 
         self.enc_dict = nn.ModuleDict(
@@ -246,7 +255,8 @@ class Forte(nn.Module):
         self.col_kind_emb = nn.Embedding(N_COL_KINDS, d_model)
 
         self.blocks = nn.ModuleList(
-            [ForteBlock(d_model, num_heads, d_ff, d_schema=d_text) for _ in range(num_blocks)]
+            [RelationalBlock(d_model, num_heads, d_ff, d_schema=d_text, use_edge_roles=use_edge_roles)
+             for _ in range(num_blocks)]
         )
         self.norm_out = nn.RMSNorm(d_model)
         self.d_model = d_model
@@ -334,7 +344,11 @@ class Forte(nn.Module):
             )
 
         for block in self.blocks:
-            x = block(x, block_masks, C, E, same_node, kv_in_f2p, q_in_f2p, rora_mask)
+            if self.grad_ckpt and self.training:
+                x = grad_checkpoint(block, x, block_masks, C, E, same_node,
+                                    kv_in_f2p, q_in_f2p, rora_mask, use_reentrant=False)
+            else:
+                x = block(x, block_masks, C, E, same_node, kv_in_f2p, q_in_f2p, rora_mask)
 
         x = self.norm_out(x)
 
@@ -407,3 +421,6 @@ class Forte(nn.Module):
         lse_pos = torch.logsumexp(scores_pos, dim=-1)
         per_q = lse_all - lse_pos                                            # (B,S)
         return per_q[query_mask].mean() + anchor
+
+# Backwards-compatible alias
+Forte = RelationalTransformer

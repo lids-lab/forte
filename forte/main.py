@@ -15,7 +15,7 @@ from torch.utils.data import DataLoader
 from tqdm.auto import tqdm
 
 from forte.data import RelationalDataset
-from forte.model import Forte
+from forte.model import RelationalTransformer
 
 
 def seed_everything(seed=42):
@@ -64,7 +64,7 @@ def all_gather_nd(tensor: torch.Tensor) -> list[torch.Tensor]:
 
 
 def _unwrap(net):
-    """Get the underlying Forte through torch.compile + DDP."""
+    """Get the underlying RelationalTransformer through torch.compile + DDP."""
     m = getattr(net, "_orig_mod", net)   # undo torch.compile
     m = getattr(m, "module", m)          # undo DDP
     return m
@@ -156,6 +156,7 @@ def main(
     psp_schedule="linear",
     psp_perturb_roles=True,
     psp_input_prob=0.20,
+    grad_ckpt=False,
 ):
     seed_everything(seed)
 
@@ -177,7 +178,7 @@ def main(
         print(run.name)
 
     torch.multiprocessing.set_sharing_strategy(
-        os.environ.get("FORTE_SHM_STRATEGY", "file_system")
+        os.environ.get("RT_SHM_STRATEGY", "file_system")
     )
     torch._dynamo.config.cache_size_limit = 16
     torch._dynamo.config.compiled_autograd = compile_ if ddp else False
@@ -231,13 +232,15 @@ def main(
                 in_order=True,
             )
 
-    net = Forte(
+    net = RelationalTransformer(
         num_blocks=num_blocks,
         d_model=d_model,
         d_text=d_text,
         num_heads=num_heads,
         d_ff=d_ff,
         use_clp=use_clp,
+        use_edge_roles=use_edge_roles,
+        grad_ckpt=grad_ckpt,
     )
     if load_ckpt_path is not None:
         load_ckpt_path = Path(load_ckpt_path).expanduser()
